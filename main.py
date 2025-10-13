@@ -1,6 +1,25 @@
 #!/usr/bin/env -S python3 -u
+#
+# A quick-and-dirty Swaybar server in Python.
+# Copyright (C) 2025 Marcin Słowik
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+#
 
+import abc
 import asyncio
+import enum
 import json
 import time
 import subprocess
@@ -9,10 +28,15 @@ import psutil
 
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable, Self
 
+## Configuration
+# By default we use the preconfigured sway font, but for monospace needs (like stacked strings) we
+# need a configured monospace font.
 font_monospace = 'RobotoMonoNerdFont'
 
+
+## Constant definitions
 nf_md_volume_off = '\U000f0581'
 nf_md_volume_low = '\U000f057f'
 nf_md_volume_medium = '\U000f0580'
@@ -26,23 +50,37 @@ nf_fa_desktop = '\uf108'
 nf_fa_network_wired = '\uef09'
 nf_fa_wifi = '\uf1eb'
 
-def autoconvert(x: int, binary=True):
+
+## Helper functions
+def autounit(x: float, binary=True) -> tuple[float, str]:
     if binary:
         if x < 1024: 
-            return str(x)
-        x //= 1024
+            return x, ""
+        x /= 1024
         if x < 1024:
-            return f"{x}Ki"
-        x //= 1024
+            return x, "Ki"
+        x /= 1024
         if x < 1024:
-            return f"{x}Mi"
-        x //= 1024
+            return x, "Mi"
+        x /= 1024
         if x < 1024:
-            return f"{x}Gi"
-        x //= 1024
-        return f"{x}Ti"
+            return x, "Gi"
+        x /= 1024
+        return x, "Ti"
     else:
-        raise NotImplementedError()
+        if x < 1000: 
+            return x, ""
+        x /= 1000
+        if x < 1000:
+            return x, "k"
+        x /= 1000
+        if x < 1000:
+            return x, "M"
+        x /= 1000
+        if x < 1000:
+            return x, "G"
+        x /= 1000
+        return x, "T"
 
 
 async def create_file_reader(file, limit=65536):
@@ -53,18 +91,30 @@ async def create_file_reader(file, limit=65536):
     return reader
 
 
+async def sub_call(*args):
+    proc = await asyncio.create_subprocess_exec(*args)
+    await proc.communicate()
+
+
+def eprint(*args):
+    print("ERROR:", *args, file=sys.stderr)
+
+
 class JSONStreamInput:
-    def __init__(self,
-                 reader: asyncio.StreamReader,
-                 callback: Callable[[Any], None],
-                 buffer_limit: int = 65536,
-                 decode_grace: int = 100,
-                 array_format: bool = False):
+    def __init__(
+        self,
+        reader: asyncio.StreamReader,
+        callback: Callable[[Any], None],
+        buffer_limit: int = 65536,
+        decode_grace: int = 100,
+        array_format: bool = False,
+        json_decoder = json.JSONDecoder()
+    ):
         self.reader = reader
         self.callback = callback
         self.buffer = ''
         self.buffer_limit = buffer_limit
-        self.json_decoder = json.JSONDecoder()
+        self.json_decoder = json_decoder
         self.default_grace = decode_grace
         self.decode_grace: int  # set to default in process_buffer
         self.array_format = array_format
@@ -82,7 +132,7 @@ class JSONStreamInput:
                     self.buffer = self.buffer[1:].lstrip()
                 self.callback(payload)
         except json.JSONDecodeError:
-            # print(f"{self.__class__} {e=} {self.buffer=} {self.decode_grace=}", file=sys.stderr)
+            # eprint(f"{self.__class__} {e=} {self.buffer=} {self.decode_grace=}")
             self.decode_grace -= 1
             self.buffer = self.buffer.lstrip()  # lstrip should always be safe
             if not self.decode_grace:
@@ -98,6 +148,7 @@ class JSONStreamInput:
             self.process_buffer()
 
 
+## Monitors
 class PipeWireMonitor:
     def __init__(self):
         self.task = asyncio.create_task(self.read_forever())
@@ -157,7 +208,7 @@ class PipeWireMonitor:
                 node = self.nodes_by_name[default_audio_sink]
                 props = [p for p in node['params']['Props'] if 'volume' in p]
                 if not props:
-                    print(f"ERROR: missing volume props for node {default_audio_sink}", file=sys.stderr)
+                    eprint(f"missing volume props for node {default_audio_sink}")
                 volume = props[0]['volume']
                 channelVolumes = props[0]['channelVolumes']
                 volume *= sum(channelVolumes) / len(channelVolumes)
@@ -174,6 +225,7 @@ class PipeWireMonitor:
     async def read_forever(self):
         self.proc = await asyncio.create_subprocess_exec("pw-dump", "-m", stdout=subprocess.PIPE)
         stdout = self.proc.stdout
+        assert stdout is not None
         json_stream_input = JSONStreamInput(stdout, self.process_update)
         await json_stream_input.read_forever()
 
@@ -190,11 +242,11 @@ class NetworkMonitor:
         bytes_recv: int = 0
         packets_sent: int = 0
         packets_recv: int = 0
-        last_update: int = 0
-        bytes_sent_rate: int = 0
-        bytes_recv_rate: int = 0
-        packets_sent_rate: int = 0
-        packets_recv_rate: int = 0
+        last_update: float = 0
+        bytes_sent_rate: float = 0
+        bytes_recv_rate: float = 0
+        packets_sent_rate: float = 0
+        packets_recv_rate: float = 0
 
     interfaces: dict[str, IfStats]
 
@@ -227,6 +279,7 @@ class NetworkMonitor:
             iface.last_update = last_update
 
 
+## Generic formatters
 def fmt_stacked(text1: str, text2: str):
     """
     Highly experimental, not really reliable
@@ -239,101 +292,194 @@ def fmt_stacked(text1: str, text2: str):
     padding = "" if t2l > t1l else '\u00a0'*(t1l-t2l)
     return f'<span font="{font_monospace}"><span rise="{rise*3//2}" font_size="{fs}">{text1}</span><span letter_spacing="-{sp}" font_size="{fs}">{"\u00a0"*t1l}</span><span rise="-{rise//2}" font_size="{fs}">{text2}{padding}</span></span>'
 
-def fmt_network(nm: NetworkMonitor):
-    all_ifaces = []
-    for if_name, iface in nm.interfaces.items():
-        if iface.is_up:
-            recv = autoconvert(iface.bytes_recv)
-            sent = autoconvert(iface.bytes_sent)
-            if if_name == 'lo':
-                if_icon = nf_fa_desktop
-            elif if_name.startswith('wlan'):
-                sfx = if_name.removeprefix('wlan')
-                if_icon = f"{nf_fa_wifi} <sub>{sfx}</sub>"
-            elif if_name.startswith('tailscale'):
-                sfx = if_name.removeprefix('tailscale')
-                if_icon = f"{nf_fa_globe} <sub>{sfx}</sub>"
-            elif if_name.startswith('en'):
-                sfx = if_name.removeprefix('en')
-                if_icon = f"{nf_fa_network_wired} <sub>{sfx}</sub>"
-            else:
-                if_icon = if_name
-            fmt_send = f"{nf_md_arrow_up_thick} {sent}B"
-            fmt_recv = f"{nf_md_arrow_down_thick} {recv}B"
-            all_ifaces.append(f"[ {if_icon} {fmt_stacked(fmt_send, fmt_recv)} ]")
-    return " ".join(all_ifaces)
+
+## WIP: Blocks
+class BlockBase(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def rendered(self) -> dict[str, str]:
+        ...
+
+    @abc.abstractmethod
+    def onclick(self, rel_x: float, rel_y: float):
+        ...
 
 
-def fmt_volume(pwm: PipeWireMonitor):
-    # # Get sink volume from wpctl
-    # sink_volume_call = subprocess.run(["wpctl", "get-volume", "@DEFAULT_AUDIO_SINK@"], capture_output=True)
-    # volume = sink_volume_call.stdout.decode().strip().removeprefix("Volume: ")
-    # is_muted = volume.endswith("[MUTED]")
-    # volume = volume.removesuffix("[MUTED]")
-    # volume = float(volume)
-    volume, is_muted = pwm.volume, pwm.is_muted
-    if is_muted:
-        icon = nf_md_volume_off
-    elif volume < 0.3:
-        icon = nf_md_volume_low
-    elif volume < 0.6:
-        icon = nf_md_volume_medium
-    else:
-        icon = nf_md_volume_high
+class ClockBlock(BlockBase):
+    def __init__(self):
+        self._rendered = {"name": "clock", "full_text": "(startup)"}
 
-    return f"{icon} {volume:.0%}"
+    @property
+    def rendered(self):
+        return self._rendered
+
+    def onclick(self, rel_x: float, rel_y: float):
+        ...
+
+    def update(self):
+        fmt_now = time.strftime("%Y-%m-%d %H:%M:%S")
+        self._rendered['full_text'] = fmt_now
+
+    async def loop(self, notify_update: Callable[[], Awaitable[Any]]):
+        N = 599
+        while True:
+            # First time each N seconds sleep less than 1 second to align with the wall clock
+            self.update()
+            await notify_update()
+            adj = time.clock_gettime(time.CLOCK_REALTIME) % 1
+            await asyncio.sleep(1 - adj)
+            for _ in range(N):
+                self.update()
+                await notify_update()
+                await asyncio.sleep(1)
 
 
-def fmt_time():
-    fmt_now = time.strftime("%Y-%m-%d %H:%M:%S")
-    return fmt_now
+class AudioBlock(BlockBase):
+    def __init__(self, pwm: PipeWireMonitor):
+        self._rendered = {"name": "audio", "full_text": "(startup)"}
+        self.pwm = pwm
+
+    @property
+    def rendered(self) -> dict[str, str]:
+        return self._rendered
+
+    def onclick(self, rel_x: float, rel_y: float):
+        if rel_x < 0.5:
+            act_toggle_mute()
+
+    def update(self):
+        volume, is_muted = self.pwm.volume, self.pwm.is_muted
+        if is_muted:
+            icon = nf_md_volume_off
+        elif volume < 0.3:
+            icon = nf_md_volume_low
+        elif volume < 0.6:
+            icon = nf_md_volume_medium
+        else:
+            icon = nf_md_volume_high
+
+        self._rendered["full_text"] = f"{icon} {volume:.0%}"
+
+    async def loop(self, notify_update: Callable[[], Awaitable[Any]]):
+        pwm_event = self.pwm.event
+        while True:
+            self.update()
+            await notify_update()
+            await pwm_event.wait()
+            pwm_event.clear()
 
 
-async def sub_call(*args):
-    proc = await asyncio.create_subprocess_exec(*args)
-    await proc.communicate()
+class NetworkMetric(enum.IntEnum):
+    Bytes = 0
+    ByteRate = 1
+    Packets = 2
+    PacketRate = 3
+
+    def next(self) -> Self:
+        next = (self.value + 1) % len(self.__class__)
+        return self.__class__(next)
 
 
+class NetworkBlock(BlockBase):
+    def __init__(self, nm):
+        self._rendered = {"name": "network", "full_text": "(startup)", "markup": "pango"}
+        self.nm = nm
+        self.metric = NetworkMetric.Bytes
+
+    @property
+    def rendered(self) -> dict[str, str]:
+        return self._rendered
+
+    def onclick(self, rel_x: float, rel_y: float):
+        self.metric = self.metric.next()
+        self.update()
+
+    @classmethod
+    def _fmt_icon(cls, if_name):
+        if if_name == 'lo':
+            if_icon = nf_fa_desktop
+        elif if_name.startswith('wlan'):
+            sfx = if_name.removeprefix('wlan')
+            if_icon = f"{nf_fa_wifi} <sub>{sfx}</sub>"
+        elif if_name.startswith('tailscale'):
+            sfx = if_name.removeprefix('tailscale')
+            if_icon = f"{nf_fa_globe} <sub>{sfx}</sub>"
+        elif if_name.startswith('en'):
+            sfx = if_name.removeprefix('en')
+            if_icon = f"{nf_fa_network_wired} <sub>{sfx}</sub>"
+        else:
+            if_icon = if_name
+        return if_icon
+
+    def _metrics(self, iface):
+        match self.metric:
+            case NetworkMetric.Bytes:
+                recv = iface.bytes_recv
+                sent = iface.bytes_sent
+                unit = "B"
+                binary = True
+            case NetworkMetric.ByteRate:
+                recv = iface.bytes_recv_rate
+                sent = iface.bytes_sent_rate
+                unit = "B/s"
+                binary = True
+            case NetworkMetric.Packets:
+                recv = iface.packets_recv
+                sent = iface.packets_sent
+                unit = "p"
+                binary = False
+            case NetworkMetric.PacketRate:
+                recv = iface.packets_recv_rate
+                sent = iface.packets_sent_rate
+                unit = "p/s"
+                binary = False
+        return recv, sent, unit, binary
+
+    @classmethod
+    def _fmt_value(cls, value: float, unit: str, binary: bool):
+        value, unitpfx = autounit(value, binary)
+        # Fix for binary units under 1024
+        if value > 1000:
+            return f"{int(round(value))}{unitpfx}{unit}"
+        else:
+            return f"{value:.3g}{unitpfx}{unit}"
+
+    def update(self):
+        self.nm.update()
+        all_ifaces = []
+        for if_name, iface in self.nm.interfaces.items():
+            if iface.is_up:
+                recv, sent, unit, binary = self._metrics(iface)
+                if_icon = self._fmt_icon(if_name)
+                fmt_send = f"{nf_md_arrow_up_thick} {self._fmt_value(sent, unit, binary)}"
+                fmt_recv = f"{nf_md_arrow_down_thick} {self._fmt_value(recv, unit, binary)}"
+                all_ifaces.append(f"[ {if_icon} {fmt_stacked(fmt_send, fmt_recv)} ]")
+        self._rendered["full_text"] = " ".join(all_ifaces)
+
+    async def loop(self, notify_update: Callable[[], Awaitable[Any]]):
+        while True:
+            self.update()
+            # No notify_update needed -- will be rendered with the next clock
+            await asyncio.sleep(5)
+
+
+## Action definitions
 def act_toggle_mute():
     asyncio.create_task(sub_call("wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"))
 
 
+## Main loop(s)
 async def main():
-    use_protocol = True
     pwm = PipeWireMonitor()
     nm = NetworkMonitor()
 
-    fld_time = fld_volume = fld_network = fld_event = "(startup)"
+    fld_event = ""
     update_queue = asyncio.Queue()
 
-    async def update_time_task():
-        nonlocal fld_time
-        N = 599
-        while True:
-            # First time each N seconds sleep less than 1 second to align with the wall clock
-            fld_time = fmt_time()
-            await update_queue.put(None)
-            adj = time.clock_gettime(time.CLOCK_REALTIME) % 1
-            await asyncio.sleep(1 - adj)
-            for _ in range(N):
-                fld_time = fmt_time()
-                await update_queue.put(None)
-                await asyncio.sleep(1)
-
-    async def update_volume_task():
-        nonlocal fld_volume
-        while True:
-            fld_volume = fmt_volume(pwm)
-            await update_queue.put(None)
-            await pwm.event.wait()
-            pwm.event.clear()
-
-    async def update_network_task():
-        nonlocal fld_network
-        while True:
-            nm.update()
-            fld_network = fmt_network(nm)
-            await asyncio.sleep(5)
+    # -- block approach --
+    clock_block = ClockBlock()
+    audio_block = AudioBlock(pwm)
+    network_block = NetworkBlock(nm)
 
     async def process_stdin():
         def update(event):
@@ -345,8 +491,12 @@ async def main():
             y_pct = rel_y / height
             fld_event = f'{name} @ {x_pct:3.1%}, {y_pct:3.1%}'
             match name:
-                case 'volume' if x_pct < 0.5:
-                    act_toggle_mute()
+                case 'network':
+                    network_block.onclick(x_pct, y_pct)
+                case 'audio':
+                    audio_block.onclick(x_pct, y_pct)
+                case 'clock':
+                    clock_block.onclick(x_pct, y_pct)
                 case _:
                     fld_event += " [unhandled]"
             asyncio.create_task(update_queue.put(None))
@@ -355,39 +505,33 @@ async def main():
         json_stream_input = JSONStreamInput(reader, update, array_format=True)
         await json_stream_input.read_forever()
 
+    async def notify():
+        await update_queue.put(None)
 
     updaters = [
-        asyncio.create_task(update_time_task()),
-        asyncio.create_task(update_volume_task()),
-        asyncio.create_task(update_network_task()),
+        asyncio.create_task(clock_block.loop(notify)),
+        asyncio.create_task(audio_block.loop(notify)),
+        asyncio.create_task(network_block.loop(notify)),
+        # ---
+        asyncio.create_task(process_stdin())
     ]
-    if use_protocol:
-        updaters.append(asyncio.create_task(process_stdin()))
 
     try:
-        if use_protocol:
-            print('{"version":1,"click_events":true}\n[')
-            while True:
-                try:
-                    msg = [
-                        # Uncomment event to debug mouse events
-                        # {"full_text":fld_event, "name":"event"},
-                        {"full_text":fld_network, "name":"network", "markup":"pango"},
-                        {"full_text":fld_volume, "name":"volume"},
-                        {"full_text":fld_time, "name":"clock"},
-                    ]
-                    msg = json.dumps(msg)
-                    print(f'{msg},')
-                    await update_queue.get()
-                except Exception as e:
-                    print(f"Error: {e!r}")
-        else:
-            while True:
-                try:
-                    print(f"{fld_network} {fld_volume} {fld_time}")
-                    await update_queue.get()
-                except Exception as e:
-                    print(f"Error: {e!r}")
+        print('{"version":1,"click_events":true}\n[')
+        while True:
+            try:
+                msg = [
+                    # Uncomment event to debug mouse events
+                    # {"full_text":fld_event, "name":"event"},
+                    network_block.rendered,
+                    audio_block.rendered,
+                    clock_block.rendered,
+                ]
+                msg = json.dumps(msg)
+                print(f'{msg},')
+                await update_queue.get()
+            except Exception as e:
+                print(f"Error: {e!r}")
     finally:
         for task in updaters:
             task.cancel()
