@@ -123,13 +123,16 @@ class JSONStreamInput:
         self.decode_grace = self.default_grace
         try:
             while self.buffer:
-                while self.array_format and self.buffer.startswith(','):
-                    self.buffer = self.buffer[1:].lstrip()
-                payload, end = self.json_decoder.raw_decode(self.buffer)
+                buffer = self.buffer.lstrip()
+                # In array format, skip the first array opening or subsequent commas between objects
+                if self.array_format:
+                    # TODO: if this works long-term, change the check to swap
+                    # between the first and consecutive times
+                    assert buffer[0] in '[,'
+                    buffer = buffer[1:].lstrip()
+                payload, end = self.json_decoder.raw_decode(buffer)
                 self.decode_grace = self.default_grace
-                self.buffer = self.buffer[end:].lstrip()
-                while self.array_format and self.buffer.startswith(','):
-                    self.buffer = self.buffer[1:].lstrip()
+                self.buffer = buffer[end:].lstrip()
                 self.callback(payload)
         except json.JSONDecodeError:
             # eprint(f"{self.__class__} {e=} {self.buffer=} {self.decode_grace=}")
@@ -139,9 +142,6 @@ class JSONStreamInput:
                 raise
 
     async def read_forever(self):
-        if self.array_format:
-            curr_buffer = await self.reader.read(1)
-            assert curr_buffer == b'['
         while not self.reader.at_eof():
             curr_buffer = await self.reader.read(self.buffer_limit)
             self.buffer += curr_buffer.decode()
