@@ -28,7 +28,7 @@ import psutil
 
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Any, Awaitable, Callable, Self
+from typing import Any, Callable, Self
 
 ## Configuration
 # By default we use the preconfigured sway font, but for monospace needs (like stacked strings) we
@@ -305,7 +305,13 @@ class BlockBase(abc.ABC):
         ...
 
 
-class ClockBlock(BlockBase):
+class BlockControllerBase(abc.ABC):
+    @abc.abstractmethod
+    async def loop(self, notify_update: Callable[[], Any]):
+        ...
+
+
+class ClockBlock(BlockBase, BlockControllerBase):
     def __init__(self):
         self._rendered = {"name": "clock", "full_text": "(startup)"}
 
@@ -320,21 +326,21 @@ class ClockBlock(BlockBase):
         fmt_now = time.strftime("%Y-%m-%d %H:%M:%S")
         self._rendered['full_text'] = fmt_now
 
-    async def loop(self, notify_update: Callable[[], Awaitable[Any]]):
+    async def loop(self, notify_update: Callable[[], Any]):
         N = 599
         while True:
             # First time each N seconds sleep less than 1 second to align with the wall clock
             self.update()
-            await notify_update()
+            notify_update()
             adj = time.clock_gettime(time.CLOCK_REALTIME) % 1
             await asyncio.sleep(1 - adj)
             for _ in range(N):
                 self.update()
-                await notify_update()
+                notify_update()
                 await asyncio.sleep(1)
 
 
-class AudioBlock(BlockBase):
+class AudioBlock(BlockBase, BlockControllerBase):
     def __init__(self, pwm: PipeWireMonitor):
         self._rendered = {"name": "audio", "full_text": "(startup)"}
         self.pwm = pwm
@@ -360,11 +366,11 @@ class AudioBlock(BlockBase):
 
         self._rendered["full_text"] = f"{icon} {volume:.0%}"
 
-    async def loop(self, notify_update: Callable[[], Awaitable[Any]]):
+    async def loop(self, notify_update: Callable[[], Any]):
         pwm_event = self.pwm.event
         while True:
             self.update()
-            await notify_update()
+            notify_update()
             await pwm_event.wait()
             pwm_event.clear()
 
@@ -380,7 +386,7 @@ class NetworkMetric(enum.IntEnum):
         return self.__class__(next)
 
 
-class NetworkBlock(BlockBase):
+class NetworkBlock(BlockBase, BlockControllerBase):
     def __init__(self, nm):
         self._rendered = {"name": "network", "full_text": "(startup)", "markup": "pango"}
         self.nm = nm
@@ -456,7 +462,7 @@ class NetworkBlock(BlockBase):
                 all_ifaces.append(f"[ {if_icon} {fmt_stacked(fmt_send, fmt_recv)} ]")
         self._rendered["full_text"] = " ".join(all_ifaces)
 
-    async def loop(self, notify_update: Callable[[], Awaitable[Any]]):
+    async def loop(self, notify_update: Callable[[], Any]):
         while True:
             self.update()
             # No notify_update needed -- will be rendered with the next clock
@@ -474,7 +480,9 @@ async def main():
     nm = NetworkMonitor()
 
     fld_event = ""
-    update_queue = asyncio.Queue()
+    update_event = asyncio.Event()
+    def notify():
+        update_event.set()
 
     # -- block approach --
     clock_block = ClockBlock()
@@ -484,7 +492,6 @@ async def main():
     async def process_stdin():
         def update(event):
             nonlocal fld_event
-            # fld_event = f'{event=}'
             name, rel_x, rel_y, width, height = \
                 event['name'], event['relative_x'], event['relative_y'], event['width'], event['height']
             x_pct = rel_x / width
@@ -499,14 +506,11 @@ async def main():
                     clock_block.onclick(x_pct, y_pct)
                 case _:
                     fld_event += " [unhandled]"
-            asyncio.create_task(update_queue.put(None))
+            update_event.set()
 
         reader = await create_file_reader(sys.stdin)
         json_stream_input = JSONStreamInput(reader, update, array_format=True)
         await json_stream_input.read_forever()
-
-    async def notify():
-        await update_queue.put(None)
 
     updaters = [
         asyncio.create_task(clock_block.loop(notify)),
@@ -520,6 +524,8 @@ async def main():
         print('{"version":1,"click_events":true}\n[')
         while True:
             try:
+                await update_event.wait()
+                update_event.clear()
                 msg = [
                     # Uncomment event to debug mouse events
                     # {"full_text":fld_event, "name":"event"},
@@ -529,13 +535,13 @@ async def main():
                 ]
                 msg = json.dumps(msg)
                 print(f'{msg},')
-                await update_queue.get()
             except Exception as e:
-                print(f"Error: {e!r}")
+                eprint(f"in main loop: {e!r}")
     finally:
         for task in updaters:
             task.cancel()
         await pwm.close()
 
-asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())
 
