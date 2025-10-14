@@ -28,7 +28,7 @@ import psutil
 
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Any, Callable, Self
+from typing import Any, Callable, Optional, Self
 
 ## Configuration
 # By default we use the preconfigured sway font, but for monospace needs (like stacked strings) we
@@ -150,15 +150,50 @@ class JSONStreamInput:
 
 ## Monitors
 class PipeWireMonitor:
+    @dataclass
+    class NodeProps:
+        id: int
+        name: str
+        info: dict
+
+        media_class: str
+
+        volume: Optional[float] = None
+        is_muted: Optional[bool] = None
+
+        @classmethod
+        def from_info(cls, id, info: dict):
+            name = info['props']['node.name']
+            media_class = info['props'].get('media.class', None)
+            volume = None
+            is_muted = None
+            try:
+                props = [p for p in info['params']['Props'] if 'volume' in p]
+                if not props:
+                    eprint(f"missing volume props for node {id}")
+                else:
+                    volume = props[0]['volume']
+                    channelVolumes = props[0]['channelVolumes']
+                    volume *= sum(channelVolumes) / len(channelVolumes)
+                    volume = round(pow(volume, 1/3), 2)
+                    is_muted = props[0]['mute']
+            except KeyError:
+                ...
+            # eprint(f"from_info: {id=} {name=} {volume=} {is_muted=}")
+            return cls(id, name, info, media_class, volume, is_muted)
+
+    nodes: dict[int, NodeProps]
+    nodes_by_name: dict[str, NodeProps]
+    devices: dict[int, Any]
+    metadata: dict[str, dict[str, Any]]
+
     def __init__(self):
         self.task = asyncio.create_task(self.read_forever())
         self.nodes = {}
         self.nodes_by_name = {}
         self.devices = {}
-        self.metadata: dict[str, dict[str, Any]] = defaultdict(dict)
+        self.metadata = defaultdict(dict)
         # ---
-        self.volume = 0
-        self.is_muted = False
         self.event = asyncio.Event()
 
     def notify_change(self):
@@ -167,7 +202,7 @@ class PipeWireMonitor:
     def try_delete_node(self, id: int):
         node = self.nodes.pop(id, None)
         if node is not None:
-            del self.nodes_by_name[node['props']['node.name']]
+            del self.nodes_by_name[node.name]
             return True
         else:
             return False
@@ -177,7 +212,8 @@ class PipeWireMonitor:
         return device is not None
 
     def process_update(self, update: list[dict[str, Any]]):
-        check_volume_update = False
+        # NOTE: all notifies in this function should trigger at the same time
+        # since this is not an async function and it doesn't have breaking points
         for entry in update:
             match entry:
                 case {'id': id, 'info': None}:
@@ -187,40 +223,45 @@ class PipeWireMonitor:
                     self.metadata[props['metadata.name']].update(
                         {m['key']: m['value'] for m in metadata}
                     )
-                    check_volume_update = True
+                    self.notify_change()
 
                 case {'id': id, 'type': "PipeWire:Interface:Node", 'info': info}:
-                    node_name = info['props']['node.name']
-                    self.nodes[id] = info
-                    self.nodes_by_name[node_name] = info
-                    check_volume_update = True
+                    node = self.NodeProps.from_info(id, info)
+                    self.nodes[id] = node
+                    self.nodes_by_name[node.name] = node
+                    self.notify_change()
 
                 case {'id': id, 'type': "PipeWire:Interface:Device", 'info': info}:
                     self.devices[id] = info
-                    check_volume_update = True
 
                 case _:
                     pass
 
-        if check_volume_update:
-            try:
-                default_audio_sink = self.metadata['default']['default.audio.sink']['name']
-                node = self.nodes_by_name[default_audio_sink]
-                props = [p for p in node['params']['Props'] if 'volume' in p]
-                if not props:
-                    eprint(f"missing volume props for node {default_audio_sink}")
-                volume = props[0]['volume']
-                channelVolumes = props[0]['channelVolumes']
-                volume *= sum(channelVolumes) / len(channelVolumes)
-                volume = round(pow(volume, 1/3), 2)
-                is_muted = props[0]['mute']
-                if self.volume != volume or self.is_muted != is_muted:
-                    self.volume = volume
-                    self.is_muted = is_muted
-                    self.notify_change()
+    @property
+    def default_audio_source(self):
+        try:
+            node_id = self.metadata['default']['default.audio.source']['name']
+            node = self.nodes_by_name[node_id]
+            return node
+        except KeyError:
+            return None
+    
+    @property
+    def default_audio_sink(self):
+        try:
+            node_id = self.metadata['default']['default.audio.sink']['name']
+            node = self.nodes_by_name[node_id]
+            return node
+        except KeyError:
+            return None
 
-            except KeyError:
-                pass
+    @property
+    def sources(self):
+        yield from (node for node in self.nodes.values() if node.media_class == 'Audio/Source')
+
+    @property
+    def sinks(self):
+        yield from (node for node in self.nodes.values() if node.media_class == 'Audio/Sinks')
 
     async def read_forever(self):
         self.proc = await asyncio.create_subprocess_exec("pw-dump", "-m", stdout=subprocess.PIPE)
@@ -289,8 +330,9 @@ def fmt_stacked(text1: str, text2: str):
     fs = 7*1024
     rise = 4096
     sp = int(1.6 * fs)
-    padding = "" if t2l > t1l else '\u00a0'*(t1l-t2l)
-    return f'<span font="{font_monospace}"><span rise="{rise*3//2}" font_size="{fs}">{text1}</span><span letter_spacing="-{sp}" font_size="{fs}">{"\u00a0"*t1l}</span><span rise="-{rise//2}" font_size="{fs}">{text2}{padding}</span></span>'
+    nbsp = '\u00a0'
+    padding = "" if t2l > t1l else nbsp*(t1l-t2l)
+    return f'<span font="{font_monospace}"><span rise="{rise*3//2}" font_size="{fs}">{text1}</span><span letter_spacing="-{sp}" font_size="{fs}">{nbsp*t1l}</span><span rise="-{rise//2}" font_size="{fs}">{text2}{padding}</span></span>'
 
 
 ## WIP: Blocks
@@ -341,9 +383,10 @@ class ClockBlock(BlockBase, BlockControllerBase):
 
 
 class AudioBlock(BlockBase, BlockControllerBase):
-    def __init__(self, pwm: PipeWireMonitor):
+    def __init__(self, pwm: PipeWireMonitor, id=None):
         self._rendered = {"name": "audio", "full_text": "(startup)"}
         self.pwm = pwm
+        self.node_id = id
 
     @property
     def rendered(self) -> dict[str, str]:
@@ -351,28 +394,36 @@ class AudioBlock(BlockBase, BlockControllerBase):
 
     def onclick(self, rel_x: float, rel_y: float):
         if rel_x < 0.5:
-            act_toggle_mute()
+            act_toggle_mute(self.node_id)
 
     def update(self):
-        volume, is_muted = self.pwm.volume, self.pwm.is_muted
-        if is_muted:
-            icon = nf_md_volume_off
-        elif volume < 0.3:
-            icon = nf_md_volume_low
-        elif volume < 0.6:
-            icon = nf_md_volume_medium
+        if self.node_id is not None:
+            node = self.pwm.nodes[self.node_id]
         else:
-            icon = nf_md_volume_high
+            node = self.pwm.default_audio_sink
+        if node is None or node.volume is None:
+            rendered = "(no audio)"
+        else:
+            volume, is_muted = node.volume, node.is_muted
+            if is_muted:
+                icon = nf_md_volume_off
+            elif volume < 0.3:
+                icon = nf_md_volume_low
+            elif volume < 0.6:
+                icon = nf_md_volume_medium
+            else:
+                icon = nf_md_volume_high
+            rendered = f"{icon} {volume:.0%}"
 
-        self._rendered["full_text"] = f"{icon} {volume:.0%}"
+        self._rendered["full_text"] = rendered
 
     async def loop(self, notify_update: Callable[[], Any]):
         pwm_event = self.pwm.event
         while True:
-            self.update()
-            notify_update()
             await pwm_event.wait()
             pwm_event.clear()
+            self.update()
+            notify_update()
 
 
 class NetworkMetric(enum.IntEnum):
@@ -470,8 +521,9 @@ class NetworkBlock(BlockBase, BlockControllerBase):
 
 
 ## Action definitions
-def act_toggle_mute():
-    asyncio.create_task(sub_call("wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"))
+def act_toggle_mute(node_id: Optional[int] = None):
+    node = "@DEFAULT_AUDIO_SINK@" if node_id is None else str(node_id)
+    asyncio.create_task(sub_call("wpctl", "set-mute", node, "toggle"))
 
 
 ## Main loop(s)
