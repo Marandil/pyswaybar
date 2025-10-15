@@ -612,6 +612,31 @@ class DebugBlock(BlockBase, BlockControllerBase):
         ...
 
 
+class InputController(BlockControllerBase):
+    def __init__(self, blocks: list[BlockBase], debug_block: DebugBlock):
+        self.blocks = blocks
+        self.debug_block = debug_block
+
+    def update(self, event: dict[str, str | int | float], notify: Callable[[], Any]):
+        try:
+            nevent = ClickEvent.from_event(event)
+            self.debug_block.record_event(nevent)
+            for block in self.blocks:
+                rendered = block.rendered
+                name, instance = rendered.get('name', None), rendered.get('instance', None)
+                if name == nevent.name and instance == nevent.instance:
+                    block.onclick(nevent)
+            notify()
+        except Exception as e:
+            self.debug_block.record_error(e)
+
+
+    async def loop(self, notify_update: Callable[[], Any]):
+        reader = await create_file_reader(sys.stdin)
+        json_stream_input = JSONStreamInput(reader, lambda x: self.update(x, notify_update), array_format=True)
+        await json_stream_input.read_forever()
+
+
 ## Action definitions
 def act_toggle_mute(node_id: Optional[int] = None):
     node = "@DEFAULT_AUDIO_SINK@" if node_id is None else str(node_id)
@@ -646,30 +671,18 @@ async def main():
         debug_block,
     ]
 
-    async def process_stdin():
-        def update(event):
-            try:
-                nevent = ClickEvent.from_event(event)
-                debug_block.record_event(nevent)
-                for block in blocks:
-                    rendered = block.rendered
-                    name, instance = rendered.get('name', None), rendered.get('instance', None)
-                    if name == nevent.name and instance == nevent.instance:
-                        block.onclick(nevent)
-                update_event.set()
-            except Exception as e:
-                debug_block.record_error(e)
+    input_controller = InputController(blocks, debug_block)
 
-        reader = await create_file_reader(sys.stdin)
-        json_stream_input = JSONStreamInput(reader, update, array_format=True)
-        await json_stream_input.read_forever()
+    controllers = [
+        clock_block,
+        audio_block,
+        network_block,
+        input_controller,
+    ]
 
     updaters = [
-        asyncio.create_task(clock_block.loop(notify)),
-        asyncio.create_task(audio_block.loop(notify)),
-        asyncio.create_task(network_block.loop(notify)),
-        # ---
-        asyncio.create_task(process_stdin())
+        asyncio.create_task(controller.loop(notify))
+        for controller in controllers
     ]
 
     try:
