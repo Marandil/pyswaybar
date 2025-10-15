@@ -21,19 +21,28 @@ import abc
 import asyncio
 import enum
 import json
-import time
+import psutil
 import subprocess
 import sys
-import psutil
+import time
 
-from dataclasses import dataclass
 from collections import defaultdict
-from typing import Any, Callable, Optional, Self
+from dataclasses import dataclass, fields
+from functools import lru_cache
+from typing import Any, Callable, Optional, Self, Type
 
 ## Configuration
 # By default we use the preconfigured sway font, but for monospace needs (like stacked strings) we
 # need a configured monospace font.
 font_monospace = 'RobotoMonoNerdFont'
+# Normal icon width relative to the swaybar height, this might be font-dependent
+icon_rel_width = 19.5/27
+DEFAULT_debug_mode_in = 10
+
+
+## Runtime Configuration
+debug_mode = False
+debug_mode_in = DEFAULT_debug_mode_in
 
 
 ## Constant definitions
@@ -44,11 +53,29 @@ nf_md_volume_high = '\U000f057e'
 
 nf_md_arrow_up_thick = '\U000f005e'
 nf_md_arrow_down_thick = '\U000f0046'
+nf_md_arrow_collapse_down = '\U000f0792'
+nf_md_arrow_collapse_left = '\U000f0793'
+nf_md_arrow_collapse_right = '\U000f0794'
+nf_md_arrow_collapse_up = '\U000f0795'
+
+nf_cod_triangle_left = '\ueb6f'
+nf_cod_triangle_right = '\ueb70'
 
 nf_fa_globe = '\uf0ac'
 nf_fa_desktop = '\uf108'
 nf_fa_network_wired = '\uef09'
 nf_fa_wifi = '\uf1eb'
+
+ev_click_lmb = 272
+ev_click_rmb = 273
+ev_click_mmb = 274
+ev_click_prev = 275
+ev_click_next = 276
+ev_click_btn6 = 277
+ev_scroll_up = 768
+ev_scroll_down = 769
+ev_scroll_right = 770
+ev_scroll_left = 771
 
 
 ## Helper functions
@@ -98,6 +125,11 @@ async def sub_call(*args):
 
 def eprint(*args):
     print("ERROR:", *args, file=sys.stderr)
+
+
+@lru_cache(maxsize=None)
+def field_names(dataclass: Type):
+    return { field.name for field in fields(dataclass) }
 
 
 class JSONStreamInput:
@@ -336,6 +368,24 @@ def fmt_stacked(text1: str, text2: str):
 
 
 ## WIP: Blocks
+@dataclass(frozen=True)
+class ClickEvent:
+    name: str
+    button: int
+    event: int
+    relative_x: int
+    relative_y: int
+    width: int
+    height: int
+    instance: Optional[str] = None
+    scale: Optional[float] = None
+
+    @classmethod
+    def from_event(cls, event: dict[str,Any]) -> Self:
+        return cls(**{k:v for k,v in event.items()
+            if k in field_names(cls)})
+
+
 class BlockBase(abc.ABC):
     @property
     @abc.abstractmethod
@@ -343,7 +393,7 @@ class BlockBase(abc.ABC):
         ...
 
     @abc.abstractmethod
-    def onclick(self, rel_x: float, rel_y: float):
+    def onclick(self, event: ClickEvent):
         ...
 
 
@@ -361,8 +411,11 @@ class ClockBlock(BlockBase, BlockControllerBase):
     def rendered(self):
         return self._rendered
 
-    def onclick(self, rel_x: float, rel_y: float):
-        ...
+    def onclick(self, event: ClickEvent):
+        global debug_mode, debug_mode_in
+        if not debug_mode and debug_mode_in <= 0:
+            debug_mode = True
+        debug_mode_in -= 1
 
     def update(self):
         fmt_now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -392,9 +445,13 @@ class AudioBlock(BlockBase, BlockControllerBase):
     def rendered(self) -> dict[str, str]:
         return self._rendered
 
-    def onclick(self, rel_x: float, rel_y: float):
-        if rel_x < 0.5:
+    def onclick(self, event: ClickEvent):
+        if event.event == ev_click_lmb:
             act_toggle_mute(self.node_id)
+        elif event.event == ev_scroll_up:
+            act_volume_up(self.node_id)
+        elif event.event == ev_scroll_down:
+            act_volume_down(self.node_id)
 
     def update(self):
         if self.node_id is not None:
@@ -447,7 +504,7 @@ class NetworkBlock(BlockBase, BlockControllerBase):
     def rendered(self) -> dict[str, str]:
         return self._rendered
 
-    def onclick(self, rel_x: float, rel_y: float):
+    def onclick(self, event: ClickEvent):
         self.metric = self.metric.next()
         self.update()
 
@@ -520,45 +577,88 @@ class NetworkBlock(BlockBase, BlockControllerBase):
             await asyncio.sleep(5)
 
 
+class DebugBlock(BlockBase, BlockControllerBase):
+    def __init__(self):
+        self._rendered = {"name": "debug", "full_text": "(startup)", "markup": "pango"}
+
+    @property
+    def rendered(self):
+        if debug_mode:
+            return self._rendered
+        else:
+            return {}
+
+    def onclick(self, event: ClickEvent):
+        global debug_mode, debug_mode_in
+        icon_width = event.height * icon_rel_width
+        if event.relative_x < icon_width:
+            debug_mode = False
+            debug_mode_in = DEFAULT_debug_mode_in
+
+    def _rerender(self, message):
+        self._rendered['full_text'] = f"{nf_cod_triangle_right} {message}"
+
+
+    def record_event(self, event: ClickEvent):
+        self._event = f"{event}"
+        self._rerender(self._event)
+
+    def record_error(self, error):
+        eprint(error)
+        self._error = f"{error=}"
+        self._rerender(self._error)
+
+    async def loop(self, notify_update: Callable[[], Any]):
+        ...
+
+
 ## Action definitions
 def act_toggle_mute(node_id: Optional[int] = None):
     node = "@DEFAULT_AUDIO_SINK@" if node_id is None else str(node_id)
     asyncio.create_task(sub_call("wpctl", "set-mute", node, "toggle"))
 
+def act_volume_up(node_id: Optional[int] = None):
+    node = "@DEFAULT_AUDIO_SINK@" if node_id is None else str(node_id)
+    asyncio.create_task(sub_call("wpctl", "set-volume", node, "1%+"))
+
+def act_volume_down(node_id: Optional[int] = None):
+    node = "@DEFAULT_AUDIO_SINK@" if node_id is None else str(node_id)
+    asyncio.create_task(sub_call("wpctl", "set-volume", node, "1%-"))
 
 ## Main loop(s)
 async def main():
     pwm = PipeWireMonitor()
     nm = NetworkMonitor()
 
-    fld_event = ""
     update_event = asyncio.Event()
     def notify():
         update_event.set()
 
-    # -- block approach --
     clock_block = ClockBlock()
     audio_block = AudioBlock(pwm)
     network_block = NetworkBlock(nm)
+    debug_block = DebugBlock()
+
+    blocks = [
+        network_block,
+        audio_block,
+        clock_block,
+        debug_block,
+    ]
 
     async def process_stdin():
         def update(event):
-            nonlocal fld_event
-            name, rel_x, rel_y, width, height = \
-                event['name'], event['relative_x'], event['relative_y'], event['width'], event['height']
-            x_pct = rel_x / width
-            y_pct = rel_y / height
-            fld_event = f'{name} @ {x_pct:3.1%}, {y_pct:3.1%}'
-            match name:
-                case 'network':
-                    network_block.onclick(x_pct, y_pct)
-                case 'audio':
-                    audio_block.onclick(x_pct, y_pct)
-                case 'clock':
-                    clock_block.onclick(x_pct, y_pct)
-                case _:
-                    fld_event += " [unhandled]"
-            update_event.set()
+            try:
+                nevent = ClickEvent.from_event(event)
+                debug_block.record_event(nevent)
+                for block in blocks:
+                    rendered = block.rendered
+                    name, instance = rendered.get('name', None), rendered.get('instance', None)
+                    if name == nevent.name and instance == nevent.instance:
+                        block.onclick(nevent)
+                update_event.set()
+            except Exception as e:
+                debug_block.record_error(e)
 
         reader = await create_file_reader(sys.stdin)
         json_stream_input = JSONStreamInput(reader, update, array_format=True)
@@ -578,13 +678,7 @@ async def main():
             try:
                 await update_event.wait()
                 update_event.clear()
-                msg = [
-                    # Uncomment event to debug mouse events
-                    # {"full_text":fld_event, "name":"event"},
-                    network_block.rendered,
-                    audio_block.rendered,
-                    clock_block.rendered,
-                ]
+                msg = [block.rendered for block in blocks]
                 msg = json.dumps(msg)
                 print(f'{msg},')
             except Exception as e:
