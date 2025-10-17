@@ -132,52 +132,39 @@ def field_names(dataclass: Type):
     return { field.name for field in fields(dataclass) }
 
 
-class JSONStreamInput:
-    def __init__(
-        self,
-        reader: asyncio.StreamReader,
-        callback: Callable[[Any], None],
-        buffer_limit: int = 65536,
-        decode_grace: int = 100,
-        array_format: bool = False,
-        json_decoder = json.JSONDecoder()
-    ):
-        self.reader = reader
-        self.callback = callback
-        self.buffer = ''
-        self.buffer_limit = buffer_limit
-        self.json_decoder = json_decoder
-        self.default_grace = decode_grace
-        self.decode_grace: int  # set to default in process_buffer
-        self.array_format = array_format
+async def json_stream_reader(
+    reader: asyncio.StreamReader,
+    buffer_limit: int = 65536,
+    decode_grace: int = 100,
+    array_format: bool = False,
+    json_decoder = json.JSONDecoder()
+):
+    buffer = ''
+    default_grace = decode_grace
+    first_element = True
 
-    def process_buffer(self):
-        self.decode_grace = self.default_grace
+    while not reader.at_eof():
+        curr_buffer = await reader.read(buffer_limit)
+        buffer += curr_buffer.decode()
+        
+        decode_grace = default_grace
         try:
-            while self.buffer:
-                buffer = self.buffer.lstrip()
+            while buffer:
+                tbuffer = buffer.lstrip()
                 # In array format, skip the first array opening or subsequent commas between objects
-                if self.array_format:
-                    # TODO: if this works long-term, change the check to swap
-                    # between the first and consecutive times
-                    assert buffer[0] in '[,'
-                    buffer = buffer[1:].lstrip()
-                payload, end = self.json_decoder.raw_decode(buffer)
-                self.decode_grace = self.default_grace
-                self.buffer = buffer[end:].lstrip()
-                self.callback(payload)
+                if array_format:
+                    assert tbuffer[0] == '[' if first_element else ','
+                    tbuffer = tbuffer[1:].lstrip()
+                payload, end = json_decoder.raw_decode(tbuffer)
+                first_element = False
+                buffer = tbuffer[end:].lstrip()
+                yield payload
         except json.JSONDecodeError:
             # eprint(f"{self.__class__} {e=} {self.buffer=} {self.decode_grace=}")
-            self.decode_grace -= 1
-            self.buffer = self.buffer.lstrip()  # lstrip should always be safe
-            if not self.decode_grace:
+            decode_grace -= 1
+            buffer = buffer.lstrip()  # lstrip should always be safe
+            if not decode_grace:
                 raise
-
-    async def read_forever(self):
-        while not self.reader.at_eof():
-            curr_buffer = await self.reader.read(self.buffer_limit)
-            self.buffer += curr_buffer.decode()
-            self.process_buffer()
 
 
 ## Monitors
@@ -299,8 +286,8 @@ class PipeWireMonitor:
         self.proc = await asyncio.create_subprocess_exec("pw-dump", "-m", stdout=subprocess.PIPE)
         stdout = self.proc.stdout
         assert stdout is not None
-        json_stream_input = JSONStreamInput(stdout, self.process_update)
-        await json_stream_input.read_forever()
+        async for update in json_stream_reader(stdout):
+            self.process_update(update)
 
     async def close(self):
         self.proc.terminate()
@@ -577,7 +564,7 @@ class NetworkBlock(BlockBase, BlockControllerBase):
             await asyncio.sleep(5)
 
 
-class DebugBlock(BlockBase, BlockControllerBase):
+class DebugBlock(BlockBase):
     def __init__(self):
         self._rendered = {"name": "debug", "full_text": "(startup)", "markup": "pango"}
 
@@ -598,7 +585,6 @@ class DebugBlock(BlockBase, BlockControllerBase):
     def _rerender(self, message):
         self._rendered['full_text'] = f"{nf_cod_triangle_right} {message}"
 
-
     def record_event(self, event: ClickEvent):
         self._event = f"{event}"
         self._rerender(self._event)
@@ -607,9 +593,6 @@ class DebugBlock(BlockBase, BlockControllerBase):
         eprint(error)
         self._error = f"{error=}"
         self._rerender(self._error)
-
-    async def loop(self, notify_update: Callable[[], Any]):
-        ...
 
 
 class InputController(BlockControllerBase):
@@ -630,11 +613,10 @@ class InputController(BlockControllerBase):
         except Exception as e:
             self.debug_block.record_error(e)
 
-
     async def loop(self, notify_update: Callable[[], Any]):
         reader = await create_file_reader(sys.stdin)
-        json_stream_input = JSONStreamInput(reader, lambda x: self.update(x, notify_update), array_format=True)
-        await json_stream_input.read_forever()
+        async for event in json_stream_reader(reader, array_format=True):
+            self.update(event, notify_update)
 
 
 ## Action definitions
