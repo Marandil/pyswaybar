@@ -146,8 +146,6 @@ async def json_stream_reader(
     while not reader.at_eof():
         curr_buffer = await reader.read(buffer_limit)
         buffer += curr_buffer.decode()
-        
-        decode_grace = default_grace
         try:
             while buffer:
                 tbuffer = buffer.lstrip()
@@ -159,6 +157,7 @@ async def json_stream_reader(
                 first_element = False
                 buffer = tbuffer[end:].lstrip()
                 yield payload
+                decode_grace = default_grace
         except json.JSONDecodeError:
             # eprint(f"{self.__class__} {e=} {self.buffer=} {self.decode_grace=}")
             decode_grace -= 1
@@ -193,25 +192,31 @@ class PipeWireMonitor:
                 else:
                     volume = props[0]['volume']
                     channelVolumes = props[0]['channelVolumes']
-                    volume *= sum(channelVolumes) / len(channelVolumes)
+                    if channelVolumes:
+                        volume *= sum(channelVolumes) / len(channelVolumes)
                     volume = round(pow(volume, 1/3), 2)
                     is_muted = props[0]['mute']
             except KeyError:
                 ...
-            # eprint(f"from_info: {id=} {name=} {volume=} {is_muted=}")
             return cls(id, name, info, media_class, volume, is_muted)
 
+    metadata: dict[str, dict[str, Any]]
+    devices: dict[int, Any]
+    clients: dict[int, Any]
     nodes: dict[int, NodeProps]
     nodes_by_name: dict[str, NodeProps]
-    devices: dict[int, Any]
-    metadata: dict[str, dict[str, Any]]
+    ports: dict[int, Any]
+    links: dict[int, Any]
 
     def __init__(self):
         self.task = asyncio.create_task(self.read_forever())
+        self.metadata = defaultdict(dict)
+        self.devices = {}
+        self.clients = {}
         self.nodes = {}
         self.nodes_by_name = {}
-        self.devices = {}
-        self.metadata = defaultdict(dict)
+        self.ports = {}
+        self.links = {}
         # ---
         self.event = asyncio.Event()
 
@@ -231,30 +236,44 @@ class PipeWireMonitor:
         return device is not None
 
     def process_update(self, update: list[dict[str, Any]]):
-        # NOTE: all notifies in this function should trigger at the same time
-        # since this is not an async function and it doesn't have breaking points
         for entry in update:
             match entry:
                 case {'id': id, 'info': None}:
+                    eprint(f"Delete node/device {id}")
                     self.try_delete_node(id) or self.try_delete_device(id)
 
                 case {'id': id, 'type': "PipeWire:Interface:Metadata", 'props': props, 'metadata': metadata}:
+                    eprint(f"Add metadata {props['metadata.name']}")
                     self.metadata[props['metadata.name']].update(
                         {m['key']: m['value'] for m in metadata}
                     )
-                    self.notify_change()
+
+                case {'id': id, 'type': "PipeWire:Interface:Device", 'info': info}:
+                    eprint(f"Add/update device {id}")
+                    self.devices[id] = info
+
+                case {'id': id, 'type': "PipeWire:Interface:Client", 'info': info}:
+                    eprint(f"Add/update client {id}")
+                    self.clients[id] = info
 
                 case {'id': id, 'type': "PipeWire:Interface:Node", 'info': info}:
+                    eprint(f"Add/update node {id}")
                     node = self.NodeProps.from_info(id, info)
                     self.nodes[id] = node
                     self.nodes_by_name[node.name] = node
-                    self.notify_change()
 
-                case {'id': id, 'type': "PipeWire:Interface:Device", 'info': info}:
-                    self.devices[id] = info
+                case {'id': id, 'type': "PipeWire:Interface:Port", 'info': info}:
+                    eprint(f"Add/update port {id}")
+                    self.ports[id] = info
+
+                case {'id': id, 'type': "PipeWire:Interface:Link", 'info': info}:
+                    eprint(f"Add/update link {id}")
+                    self.links[id] = info
 
                 case _:
+                    eprint(f"Other: {entry}"[:512], "...")
                     pass
+        self.notify_change()
 
     @property
     def default_audio_source(self):
@@ -448,6 +467,7 @@ class AudioBlock(BlockBase, BlockControllerBase):
         if node is None or node.volume is None:
             rendered = "(no audio)"
         else:
+            eprint(f"audio update for node: {node.id} {node.name} {node.volume} {node.is_muted} {node.media_class} {node.info['params']['Props']=}"[:1024], "...")
             volume, is_muted = node.volume, node.is_muted
             if is_muted:
                 icon = nf_md_volume_off
@@ -596,7 +616,7 @@ class DebugBlock(BlockBase):
 
 
 class InputController(BlockControllerBase):
-    def __init__(self, blocks: list[BlockBase], debug_block: DebugBlock):
+    def __init__(self, blocks: Iterable[BlockBase], debug_block: DebugBlock):
         self.blocks = blocks
         self.debug_block = debug_block
 
@@ -609,6 +629,9 @@ class InputController(BlockControllerBase):
                 name, instance = rendered.get('name', None), rendered.get('instance', None)
                 if name == nevent.name and instance == nevent.instance:
                     block.onclick(nevent)
+                    break
+            else:
+                eprint(f"Unhandled input event: {nevent}")
             notify()
         except Exception as e:
             self.debug_block.record_error(e)
@@ -631,6 +654,7 @@ def act_volume_up(node_id: Optional[int] = None):
 def act_volume_down(node_id: Optional[int] = None):
     node = "@DEFAULT_AUDIO_SINK@" if node_id is None else str(node_id)
     asyncio.create_task(sub_call("wpctl", "set-volume", node, "1%-"))
+
 
 ## Main loop(s)
 async def main():
