@@ -17,6 +17,8 @@
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 #
 
+from __future__ import annotations
+
 import abc
 import asyncio
 import enum
@@ -29,7 +31,10 @@ import time
 from collections import defaultdict
 from dataclasses import dataclass, fields
 from functools import lru_cache
-from typing import Any, Callable, Optional, Self, Type
+from typing import Any, Callable, Generator, Iterable, Iterator, Optional, Self, Sequence, Type, TypeVar
+
+T = TypeVar('T')
+
 
 ## Configuration
 # By default we use the preconfigured sway font, but for monospace needs (like stacked strings) we
@@ -58,8 +63,10 @@ nf_md_arrow_collapse_left = '\U000f0793'
 nf_md_arrow_collapse_right = '\U000f0794'
 nf_md_arrow_collapse_up = '\U000f0795'
 
+nf_cod_triangle_down = '\ueb6e'
 nf_cod_triangle_left = '\ueb6f'
 nf_cod_triangle_right = '\ueb70'
+nf_cod_triangle_up = '\ueb71'
 
 nf_fa_globe = '\uf0ac'
 nf_fa_desktop = '\uf108'
@@ -76,6 +83,50 @@ ev_scroll_up = 768
 ev_scroll_down = 769
 ev_scroll_right = 770
 ev_scroll_left = 771
+
+
+## Generic formatters
+def fmt_stacked(text1: str, text2: str):
+    """
+    Highly experimental, not really reliable
+    """
+    t1l = len(text1)
+    t2l = len(text2)
+    fs = 7*1024
+    rise = 4096
+    sp = int(1.6 * fs)
+    nbsp = '\u00a0'
+    padding = "" if t2l > t1l else nbsp*(t1l-t2l)
+    return f'<span font="{font_monospace}"><span rise="{rise*3//2}" font_size="{fs}">{text1}</span><span letter_spacing="-{sp}" font_size="{fs}">{nbsp*t1l}</span><span rise="-{rise//2}" font_size="{fs}">{text2}{padding}</span></span>'
+
+
+def fmt_icon(if_name: str):
+    if if_name == 'lo':
+        if_icon = nf_fa_desktop
+    elif if_name.startswith('wlan'):
+        sfx = if_name.removeprefix('wlan')
+        if_icon = f"{nf_fa_wifi} <sub>{sfx}</sub>"
+    elif if_name.startswith('tailscale'):
+        sfx = if_name.removeprefix('tailscale')
+        if_icon = f"{nf_fa_globe} <sub>{sfx}</sub>"
+    elif if_name.startswith('en'):
+        sfx = if_name.removeprefix('en')
+        if_icon = f"{nf_fa_network_wired} <sub>{sfx}</sub>"
+    else:
+        if_icon = if_name
+    return if_icon
+
+
+def fmt_value(value: float, unit: str, binary: bool):
+    value, unitpfx = autounit(value, binary)
+    # Fix for binary units under 1024
+    if value > 1000:
+        return f"{int(round(value))}{unitpfx}{unit}"
+    else:
+        return f"{value:.3g}{unitpfx}{unit}"
+
+
+icon_triangle_up_down = fmt_stacked(nf_cod_triangle_up, nf_cod_triangle_down)
 
 
 ## Helper functions
@@ -164,6 +215,18 @@ async def json_stream_reader(
             buffer = buffer.lstrip()  # lstrip should always be safe
             if not decode_grace:
                 raise
+
+
+class RepeatingIterator(Iterable[T]):
+    def  __init__(self, func: Callable[[], Generator[T, None, None]]):
+        self.func = func
+
+    def __iter__(self) -> Iterator[T]:
+        return self.func()
+
+
+def repeating(func: Callable[[], Generator[T, None, None]]) -> Iterable[T]:
+    return RepeatingIterator(func)
 
 
 ## Monitors
@@ -315,7 +378,7 @@ class PipeWireMonitor:
 
 class NetworkMonitor:
     @dataclass
-    class IfStats:
+    class NetStats:
         is_up: bool = False
         bytes_sent: int = 0
         bytes_recv: int = 0
@@ -327,20 +390,24 @@ class NetworkMonitor:
         packets_sent_rate: float = 0
         packets_recv_rate: float = 0
 
-    interfaces: dict[str, IfStats]
+    interfaces: dict[str, NetStats]
 
     def __init__(self):
-        IfStats = self.IfStats
-        self.interfaces = defaultdict(lambda: IfStats())
+        NetStats = self.NetStats
+        self.interfaces = defaultdict(NetStats)
 
     def update(self):
         net_stats = psutil.net_if_stats()
         net_ioctr = psutil.net_io_counters(pernic=True, nowrap=True)
+        last_update = time.perf_counter()
+        cumst = self.interfaces['*']
+        cumst.last_update = last_update
+        cumst.bytes_sent = cumst.bytes_sent_rate = cumst.packets_sent = cumst.packets_sent_rate = 0
+        cumst.bytes_recv = cumst.bytes_recv_rate = cumst.packets_recv = cumst.packets_recv_rate = 0
         for if_name, if_stats in net_stats.items():
             ioctrs = net_ioctr[if_name]
             iface = self.interfaces[if_name]
             iface.is_up = if_stats.isup
-            last_update = time.perf_counter()
             if iface.last_update:
                 bytes_sent_delta = ioctrs.bytes_sent - iface.bytes_sent
                 bytes_recv_delta = ioctrs.bytes_recv - iface.bytes_recv
@@ -351,26 +418,19 @@ class NetworkMonitor:
                 iface.bytes_recv_rate = bytes_recv_delta / last_update_delta
                 iface.packets_sent_rate = packets_sent_delta / last_update_delta
                 iface.packets_recv_rate = packets_recv_delta / last_update_delta
+                cumst.bytes_sent_rate += iface.bytes_sent_rate
+                cumst.bytes_recv_rate += iface.bytes_recv_rate
+                cumst.packets_sent_rate += iface.packets_sent_rate
+                cumst.packets_recv_rate += iface.packets_recv_rate
             iface.bytes_sent = ioctrs.bytes_sent
             iface.bytes_recv = ioctrs.bytes_recv
             iface.packets_sent = ioctrs.packets_sent
             iface.packets_recv = ioctrs.packets_recv
+            cumst.bytes_sent += iface.bytes_sent
+            cumst.bytes_recv += iface.bytes_recv
+            cumst.packets_sent += iface.packets_sent
+            cumst.packets_recv += iface.packets_recv
             iface.last_update = last_update
-
-
-## Generic formatters
-def fmt_stacked(text1: str, text2: str):
-    """
-    Highly experimental, not really reliable
-    """
-    t1l = len(text1)
-    t2l = len(text2)
-    fs = 7*1024
-    rise = 4096
-    sp = int(1.6 * fs)
-    nbsp = '\u00a0'
-    padding = "" if t2l > t1l else nbsp*(t1l-t2l)
-    return f'<span font="{font_monospace}"><span rise="{rise*3//2}" font_size="{fs}">{text1}</span><span letter_spacing="-{sp}" font_size="{fs}">{nbsp*t1l}</span><span rise="-{rise//2}" font_size="{fs}">{text2}{padding}</span></span>'
 
 
 ## WIP: Blocks
@@ -406,6 +466,13 @@ class BlockBase(abc.ABC):
 class BlockControllerBase(abc.ABC):
     @abc.abstractmethod
     async def loop(self, notify_update: Callable[[], Any]):
+        ...
+
+
+class BlockCollectionBase(abc.ABC):
+    @property
+    @abc.abstractmethod
+    def blocks(self) -> Iterable[BlockBase]:
         ...
 
 
@@ -501,87 +568,111 @@ class NetworkMetric(enum.IntEnum):
         return self.__class__(next)
 
 
-class NetworkBlock(BlockBase, BlockControllerBase):
-    def __init__(self, nm):
-        self._rendered = {"name": "network", "full_text": "(startup)", "markup": "pango"}
+class NetworkBlockControllerMode(enum.IntEnum):
+    Cumulative = 0
+    All = 1
+    Highest = 2
+
+
+class NetworkBlockController(BlockControllerBase, BlockCollectionBase):
+    _cum_block: NetworkBlock
+    _all_blocks: Sequence[NetworkBlock]
+    _all_block_names: Any | None
+
+    def __init__(self, nm: NetworkMonitor):
         self.nm = nm
         self.metric = NetworkMetric.Bytes
+        self.mode = NetworkBlockControllerMode.All
+        self._cum_block = NetworkBlock('*', nm.interfaces['*'], self)
+        self._all_blocks = []
+        self._all_block_names = None
 
     @property
-    def rendered(self) -> dict[str, str]:
-        return self._rendered
-
-    def onclick(self, event: ClickEvent):
-        self.metric = self.metric.next()
-        self.update()
-
-    @classmethod
-    def _fmt_icon(cls, if_name):
-        if if_name == 'lo':
-            if_icon = nf_fa_desktop
-        elif if_name.startswith('wlan'):
-            sfx = if_name.removeprefix('wlan')
-            if_icon = f"{nf_fa_wifi} <sub>{sfx}</sub>"
-        elif if_name.startswith('tailscale'):
-            sfx = if_name.removeprefix('tailscale')
-            if_icon = f"{nf_fa_globe} <sub>{sfx}</sub>"
-        elif if_name.startswith('en'):
-            sfx = if_name.removeprefix('en')
-            if_icon = f"{nf_fa_network_wired} <sub>{sfx}</sub>"
-        else:
-            if_icon = if_name
-        return if_icon
-
-    def _metrics(self, iface):
-        match self.metric:
-            case NetworkMetric.Bytes:
-                recv = iface.bytes_recv
-                sent = iface.bytes_sent
-                unit = "B"
-                binary = True
-            case NetworkMetric.ByteRate:
-                recv = iface.bytes_recv_rate
-                sent = iface.bytes_sent_rate
-                unit = "B/s"
-                binary = True
-            case NetworkMetric.Packets:
-                recv = iface.packets_recv
-                sent = iface.packets_sent
-                unit = "p"
-                binary = False
-            case NetworkMetric.PacketRate:
-                recv = iface.packets_recv_rate
-                sent = iface.packets_sent_rate
-                unit = "p/s"
-                binary = False
-        return recv, sent, unit, binary
-
-    @classmethod
-    def _fmt_value(cls, value: float, unit: str, binary: bool):
-        value, unitpfx = autounit(value, binary)
-        # Fix for binary units under 1024
-        if value > 1000:
-            return f"{int(round(value))}{unitpfx}{unit}"
-        else:
-            return f"{value:.3g}{unitpfx}{unit}"
+    def blocks(self) -> Iterator[NetworkBlock]:
+        match(self.mode):
+            case NetworkBlockControllerMode.Cumulative:
+                yield self._cum_block
+            case NetworkBlockControllerMode.All:
+                yield from self._all_blocks
+            case NetworkBlockControllerMode.Highest:
+                yield self._cum_block
 
     def update(self):
         self.nm.update()
-        all_ifaces = []
-        for if_name, iface in self.nm.interfaces.items():
-            if iface.is_up:
-                recv, sent, unit, binary = self._metrics(iface)
-                if_icon = self._fmt_icon(if_name)
-                fmt_send = f"{nf_md_arrow_up_thick} {self._fmt_value(sent, unit, binary)}"
-                fmt_recv = f"{nf_md_arrow_down_thick} {self._fmt_value(recv, unit, binary)}"
-                all_ifaces.append(f"[ {if_icon} {fmt_stacked(fmt_send, fmt_recv)} ]")
-        self._rendered["full_text"] = " ".join(all_ifaces)
+        # Update _all_blocks if the observed interfaces changed
+        block_names = [k for k,v in self.nm.interfaces.items() if v.is_up]
+        # The order in which the names appear should not have changed since dict keys are stable
+        if block_names != self._all_block_names:
+            # Need to recreate _all_blocks, cheapest way is from scratch
+            eprint(f"Change in observed interface list: {self._all_block_names} -> {block_names}")
+            nblocks = [
+                NetworkBlock(if_name, if_stats, self)
+                for if_name, if_stats in self.nm.interfaces.items()
+                if if_stats.is_up and if_name != '*'
+            ] + [self._cum_block]
+            self._all_blocks = nblocks
+            self._all_block_names = block_names
+        for block in self._all_blocks:
+            block.update(self.metric)
 
     async def loop(self, notify_update: Callable[[], Any]):
         while True:
             self.update()
             # No notify_update needed -- will be rendered with the next clock
             await asyncio.sleep(5)
+
+
+class NetworkBlock(BlockBase):
+    def __init__(
+        self,
+        if_name: str,
+        stats: NetworkMonitor.NetStats,
+        nc: NetworkBlockController
+    ):
+        self._rendered = {"name": "network", "instance": if_name, "full_text": "(startup)", "markup": "pango"}
+        self.if_name = if_name
+        self.if_icon = fmt_icon(if_name)
+        self.stats = stats
+        self.nc = nc
+
+    @property
+    def rendered(self) -> dict[str, str]:
+        return self._rendered
+
+    def onclick(self, event: ClickEvent):
+        self.nc.metric = self.nc.metric.next()
+        self.nc.update()
+
+    def _metrics(self, metric: NetworkMetric):
+        match metric:
+            case NetworkMetric.Bytes:
+                recv = self.stats.bytes_recv
+                sent = self.stats.bytes_sent
+                unit = "B"
+                binary = True
+            case NetworkMetric.ByteRate:
+                recv = self.stats.bytes_recv_rate
+                sent = self.stats.bytes_sent_rate
+                unit = "B/s"
+                binary = True
+            case NetworkMetric.Packets:
+                recv = self.stats.packets_recv
+                sent = self.stats.packets_sent
+                unit = "p"
+                binary = False
+            case NetworkMetric.PacketRate:
+                recv = self.stats.packets_recv_rate
+                sent = self.stats.packets_sent_rate
+                unit = "p/s"
+                binary = False
+        return recv, sent, unit, binary
+
+    def update(self, metric: NetworkMetric):
+        recv, sent, unit, binary = self._metrics(metric)
+        fmt_send = f"{nf_md_arrow_up_thick} {fmt_value(sent, unit, binary)}"
+        fmt_recv = f"{nf_md_arrow_down_thick} {fmt_value(recv, unit, binary)}"
+        rendered = f"{self.if_icon} {fmt_stacked(fmt_send, fmt_recv)}"
+        self._rendered["full_text"] = rendered
 
 
 class DebugBlock(BlockBase):
@@ -667,22 +758,22 @@ async def main():
 
     clock_block = ClockBlock()
     audio_block = AudioBlock(pwm)
-    network_block = NetworkBlock(nm)
+    network_controller = NetworkBlockController(nm)
     debug_block = DebugBlock()
 
-    blocks = [
-        network_block,
-        audio_block,
-        clock_block,
-        debug_block,
-    ]
+    @repeating
+    def blocks():
+        yield from network_controller.blocks
+        yield audio_block
+        yield clock_block
+        yield debug_block
 
     input_controller = InputController(blocks, debug_block)
 
     controllers = [
         clock_block,
         audio_block,
-        network_block,
+        network_controller,
         input_controller,
     ]
 
