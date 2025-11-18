@@ -63,6 +63,8 @@ nf_md_arrow_collapse_left = '\U000f0793'
 nf_md_arrow_collapse_right = '\U000f0794'
 nf_md_arrow_collapse_up = '\U000f0795'
 
+nf_md_vpn = '\U000f0582'
+
 nf_cod_triangle_down = '\ueb6e'
 nf_cod_triangle_left = '\ueb6f'
 nf_cod_triangle_right = '\ueb70'
@@ -72,6 +74,7 @@ nf_fa_globe = '\uf0ac'
 nf_fa_desktop = '\uf108'
 nf_fa_network_wired = '\uef09'
 nf_fa_wifi = '\uf1eb'
+nf_fa_docker = '\uf21f'
 
 ev_click_lmb = 272
 ev_click_rmb = 273
@@ -108,12 +111,24 @@ def fmt_icon(if_name: str):
         if_icon = f"{nf_fa_wifi} <sub>{sfx}</sub>"
     elif if_name.startswith('tailscale'):
         sfx = if_name.removeprefix('tailscale')
-        if_icon = f"{nf_fa_globe} <sub>{sfx}</sub>"
+        if_icon = f"{nf_md_vpn} <sub>{sfx}</sub>"
     elif if_name.startswith('en'):
         sfx = if_name.removeprefix('en')
         if_icon = f"{nf_fa_network_wired} <sub>{sfx}</sub>"
+    elif if_name == '*':
+        if_icon = f"{nf_fa_globe} "
+    elif if_name.startswith('docker'):
+        sfx = if_name.removeprefix('docker')
+        if_icon = f"{nf_fa_docker} <sub>{sfx}</sub>"
+    elif if_name.startswith('veth'):  # TODO: regexp with hex
+        sfx = if_name.removeprefix('veth')[:2]
+        if_icon = f"{nf_fa_docker} <sub>{sfx}</sub>"
+    elif if_name.startswith('br-'):  # TODO: regexp with hex
+        sfx = if_name.removeprefix('br-')[:2]
+        sfx = fmt_stacked('br', sfx)
+        if_icon = f"{nf_fa_docker} {sfx}"
     else:
-        if_icon = if_name
+        if_icon = f"{nf_fa_globe} <sub>{if_name}</sub>"
     return if_icon
 
 
@@ -783,7 +798,7 @@ async def main():
     ]
 
     try:
-        print('{"version":1,"click_events":true}\n[')
+        print('{"version":1,"click_events":true,"cont_signal":18,"stop_signal":19}\n[')
         while True:
             try:
                 await update_event.wait()
