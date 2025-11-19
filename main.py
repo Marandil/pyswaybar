@@ -103,7 +103,7 @@ def fmt_stacked(text1: str, text2: str):
     return f'<span font="{font_monospace}"><span rise="{rise*3//2}" font_size="{fs}">{text1}</span><span letter_spacing="-{sp}" font_size="{fs}">{nbsp*t1l}</span><span rise="-{rise//2}" font_size="{fs}">{text2}{padding}</span></span>'
 
 
-def fmt_icon(if_name: str):
+def fmt_if_icon(if_name: str):
     if if_name == 'lo':
         if_icon = nf_fa_desktop
     elif if_name.startswith('wlan'):
@@ -130,15 +130,6 @@ def fmt_icon(if_name: str):
     else:
         if_icon = f"{nf_fa_globe} <sub>{if_name}</sub>"
     return if_icon
-
-
-def fmt_value(value: float, unit: str, binary: bool):
-    value, unitpfx = autounit(value, binary)
-    # Fix for binary units under 1024
-    if value > 1000:
-        return f"{int(round(value))}{unitpfx}{unit}"
-    else:
-        return f"{value:.3g}{unitpfx}{unit}"
 
 
 icon_triangle_up_down = fmt_stacked(nf_cod_triangle_up, nf_cod_triangle_down)
@@ -174,6 +165,15 @@ def autounit(x: float, binary=True) -> tuple[float, str]:
             return x, "G"
         x /= 1000
         return x, "T"
+
+
+def fmt_autounit(value: float, unit: str, binary: bool):
+    value, unitpfx = autounit(value, binary)
+    # Fix for binary units under 1024
+    if value > 1000:
+        return f"{int(round(value))}{unitpfx}{unit}"
+    else:
+        return f"{value:.3g}{unitpfx}{unit}"
 
 
 async def create_file_reader(file, limit=65536):
@@ -588,27 +588,42 @@ class NetworkBlockControllerMode(enum.IntEnum):
     All = 1
     Highest = 2
 
+    def next(self) -> Self:
+        next = (self.value + 1) % len(self.__class__)
+        return self.__class__(next)
+
 
 class NetworkBlockController(BlockControllerBase, BlockCollectionBase):
     _cum_block: NetworkBlock
-    _all_blocks: Sequence[NetworkBlock]
-    _all_block_names: Any | None
+    _high_block: NetworkBlock
+    _if_blocks: Sequence[NetworkBlock]
+    _if_block_names: Any | None
 
     def __init__(self, nm: NetworkMonitor):
         self.nm = nm
         self.metric = NetworkMetric.Bytes
         self.mode = NetworkBlockControllerMode.All
         self._cum_block = NetworkBlock('*', nm.interfaces['*'], self)
-        self._all_blocks = []
-        self._all_block_names = None
+        self._high_block = self._cum_block
+        self._if_blocks = []
+        self._if_block_names = None
+
+    def next_metric(self):
+        self.metric = self.metric.next()
+        self.update()
+
+    def next_mode(self):
+        self.mode = self.mode.next()
+        self.update()
 
     @property
     def blocks(self) -> Iterator[NetworkBlock]:
         match(self.mode):
             case NetworkBlockControllerMode.Cumulative:
-                yield self._cum_block
+                yield self._high_block
             case NetworkBlockControllerMode.All:
-                yield from self._all_blocks
+                yield from self._if_blocks
+                yield self._cum_block
             case NetworkBlockControllerMode.Highest:
                 yield self._cum_block
 
@@ -617,18 +632,25 @@ class NetworkBlockController(BlockControllerBase, BlockCollectionBase):
         # Update _all_blocks if the observed interfaces changed
         block_names = [k for k,v in self.nm.interfaces.items() if v.is_up]
         # The order in which the names appear should not have changed since dict keys are stable
-        if block_names != self._all_block_names:
-            # Need to recreate _all_blocks, cheapest way is from scratch
-            eprint(f"Change in observed interface list: {self._all_block_names} -> {block_names}")
-            nblocks = [
+        if block_names != self._if_block_names:
+            # Need to recreate _if_blocks, cheapest way is from scratch
+            eprint(f"Change in observed interface list: {self._if_block_names} -> {block_names}")
+            ifblocks = [
                 NetworkBlock(if_name, if_stats, self)
                 for if_name, if_stats in self.nm.interfaces.items()
                 if if_stats.is_up and if_name != '*'
-            ] + [self._cum_block]
-            self._all_blocks = nblocks
-            self._all_block_names = block_names
-        for block in self._all_blocks:
+            ]
+            self._if_blocks = ifblocks
+            self._if_block_names = block_names
+        for block in self._if_blocks:
             block.update(self.metric)
+        self._cum_block.update(self.metric)
+        # Select high_block
+        if self.mode == NetworkBlockControllerMode.Highest:
+            if self._if_blocks:
+                self._high_block = max(self._if_blocks, key=lambda block: block.key)
+            else:
+                self._high_block = self._cum_block
 
     async def loop(self, notify_update: Callable[[], Any]):
         while True:
@@ -642,23 +664,27 @@ class NetworkBlock(BlockBase):
         self,
         if_name: str,
         stats: NetworkMonitor.NetStats,
-        nc: NetworkBlockController
+        nc: NetworkBlockController,
     ):
         self._rendered = {"name": "network", "instance": if_name, "full_text": "(startup)", "markup": "pango"}
         self.if_name = if_name
-        self.if_icon = fmt_icon(if_name)
+        self.if_icon = fmt_if_icon(if_name)
         self.stats = stats
         self.nc = nc
+        self.key = 0
 
     @property
     def rendered(self) -> dict[str, str]:
         return self._rendered
 
     def onclick(self, event: ClickEvent):
-        self.nc.metric = self.nc.metric.next()
-        self.nc.update()
+        icon_width = event.height * icon_rel_width
+        if event.relative_x < icon_width:
+            self.nc.next_mode()
+        else:
+            self.nc.next_metric()
 
-    def _metrics(self, metric: NetworkMetric):
+    def metrics(self, metric: NetworkMetric):
         match metric:
             case NetworkMetric.Bytes:
                 recv = self.stats.bytes_recv
@@ -683,11 +709,12 @@ class NetworkBlock(BlockBase):
         return recv, sent, unit, binary
 
     def update(self, metric: NetworkMetric):
-        recv, sent, unit, binary = self._metrics(metric)
-        fmt_send = f"{nf_md_arrow_up_thick} {fmt_value(sent, unit, binary)}"
-        fmt_recv = f"{nf_md_arrow_down_thick} {fmt_value(recv, unit, binary)}"
-        rendered = f"{self.if_icon} {fmt_stacked(fmt_send, fmt_recv)}"
+        recv, sent, unit, binary = self.metrics(metric)
+        fmt_send = f"{fmt_autounit(sent, unit, binary)}"
+        fmt_recv = f"{fmt_autounit(recv, unit, binary)}"
+        rendered = f"{self.if_icon} {icon_triangle_up_down} {fmt_stacked(fmt_send, fmt_recv)}"
         self._rendered["full_text"] = rendered
+        self.key = recv + sent
 
 
 class DebugBlock(BlockBase):
@@ -797,6 +824,8 @@ async def main():
         for controller in controllers
     ]
 
+    json_encoder = json.JSONEncoder()
+
     try:
         print('{"version":1,"click_events":true,"cont_signal":18,"stop_signal":19}\n[')
         while True:
@@ -804,7 +833,7 @@ async def main():
                 await update_event.wait()
                 update_event.clear()
                 msg = [block.rendered for block in blocks]
-                msg = json.dumps(msg)
+                msg = json_encoder.encode(msg)
                 print(f'{msg},')
             except Exception as e:
                 eprint(f"in main loop: {e!r}")
